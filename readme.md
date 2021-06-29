@@ -4,7 +4,7 @@
 
 ### 2、数据集Crosswoz
 
-数据集Crosswoz是2020年清华大学人工智能研究院发布的一个大规模中文对话数据集，可应用于任务型对话系统中各个部分，包括NLU、DST、对话策略学习、NLG等。
+数据集Crosswoz是2020年清华大学人工智能研究院发布的一个大规模中文对话数据集，可应用于任务型对话系统中各个部分，包括NLU、DST、对话策略学习、NLG等。  
 论文：[CrossWOZ: A Large-Scale Chinese Cross-Domain Task-Oriented Dialogue Dataset](https://arxiv.org/abs/2002.11893)
 
 ### 3、NLU任务说明
