@@ -27,6 +27,7 @@ if __name__ == "__main__":
                     intents = []
                     tags = ['O'] * len(utterance)
                     for intent, domain, slot, slot_value in turn['dialog_act']:
+                        # i_intent = "+".join([intent, domain])
                         intents.append(intent)
                         all_intents[intent] += 1
                         if slot_value in utterance:
@@ -44,7 +45,8 @@ if __name__ == "__main__":
                             "intents":intents,
                             "tags": " ".join(tags),
                             "action":turn['dialog_act'],
-                        }
+                        } 
+
                     )
                 new_data[sess_id] = new_sess
             print(f"data size: {len(new_data)}")

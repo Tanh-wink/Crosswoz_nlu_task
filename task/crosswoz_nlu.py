@@ -13,13 +13,14 @@ sys.path.extend([os.path.abspath(".."), word_dir])
 from basic.basic_task import Basic_task, Task_Mode
 from basic.register import register_task, find_task
 from utils.build_vocab import Vocab
-from utils.utils import check_dir
+from utils.utils import check_dir, calculateF1
 
 import torch
 from torch import nn
 from TorchCRF import CRF
 from transformers import BertPreTrainedModel, BertConfig, BertTokenizer, BertModel
 from utils.ner_metrics import SeqEntityScore
+import matplotlib.pyplot as plt
 
 logging.basicConfig(format='%(asctime)s:%(levelname)s: %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,16 +32,24 @@ Crosswoz NLU任务
 数据集：Crosswoz数据
     -训练集：5012个对话，84692个utterance（句子）
     -验证集：500个对话，8458个utterance（句子）
-    -测试集：500个对话，8400个utterance（句子）
+    -测试集：500个对话，8476个utterance（句子）
 槽位提取模型：bert + Bilstm + crf  
-intent 模型：
+intent 模型：bert + Bilstm + linear + sigmoid
 
-slot提取效果：acc: 0.9654 ,  recall: 0.9779 ,  f1: 0.9716 （验证集）
+intent识别效果
+    验证集： p = 0.9865, r = 0.9042, f1 = 0.9435
+    测试集： p = 0.9859, r = 0.8976, f1 = 0.9397
+
+slot提取效果：
+    验证集： acc = 0.9658 ,  recall = 0.9794 ,  f1 = 0.9726 
+    测试集： acc = 0.9637 ,  recall = 0.9798 ,  f1 = 0.9717
+
 """
 class Config:
     seed = 42   # 随机种子
     gpuids = "1"  # 设置显卡序号，若为None，则不使用gpu
     nlog = 100  # 多少step打印一次记录（loss，评估指标）
+    neval = 300
     early_stop = True
 
     train_batch_size = 32
@@ -55,7 +64,7 @@ class Config:
     # 新增超参数
     margin = 1
     max_len = 128
-    rnn_dim = 128
+    hidden_units = 128
     num_labels = 12
     use_lstm = True
 
@@ -63,7 +72,7 @@ class Config:
 
     # 配置路径
     train_data_path = "/workspace/crosswoz_nlu/data/crosswoz/nlu/train_nlu.json"  # 训练集数据的路径，建议绝对路径
-    dev_data_path = ["/workspace/crosswoz_nlu/data/crosswoz/nlu/val_nlu.json"] # 验证集数据的路径，建议绝对路径
+    dev_data_path = ["/workspace/crosswoz_nlu/data/crosswoz/nlu/val_nlu.json", "/workspace/crosswoz_nlu/data/crosswoz/nlu/test_nlu.json"] # 验证集数据的路径，建议绝对路径
     test_data_path = ["/workspace/crosswoz_nlu/data/crosswoz/nlu/test_nlu.json"]  # 测试集数据的路径，建议绝对路径
 
     # transformer结构(Bert, Albert, Roberta等)的预训练模型的配置, 路径也建议是绝对路径
@@ -91,10 +100,11 @@ class Model(BertPreTrainedModel):
         self.model_config = model_config
         self.task_config = task_config
         self.bert = BertModel(config=model_config)
-        self.lstm = nn.LSTM(model_config.hidden_size, task_config.rnn_dim, num_layers=1, bidirectional=True, batch_first=True)
+        self.lstm = nn.LSTM(model_config.hidden_size, task_config.hidden_units, num_layers=1, bidirectional=True, batch_first=True)
         self.dropout = nn.Dropout(0.5)
-        self.linear = nn.Linear(task_config.rnn_dim * 2, task_config.num_labels)
-        self.crf = CRF(task_config.num_labels, use_gpu=True)
+        self.intent_classifier = nn.Linear(model_config.hidden_size, task_config.intent_num_labels)
+        self.slot_classifier = nn.Linear(task_config.hidden_units * 2, task_config.slot_num_labels)
+        self.crf = CRF(task_config.slot_num_labels, use_gpu=True)
 
         self.init_weights()
 
@@ -103,26 +113,38 @@ class Model(BertPreTrainedModel):
         input_ids = inputs.get("input_ids", None)
         attention_mask = inputs.get("input_masks", None)
         token_type_ids = inputs.get("token_type_ids", None)
+        intent_ids = inputs.get("intent_ids", None)
         slot_ids = inputs.get("slot_ids", None)
+        intent_weights = inputs.get("intent_weights", None)
 
         # input_ids [batch, max_seq_length]  sequence_outputs [batch, max_seq_length, hidden_state]
         bert_outputs = self.bert(input_ids, attention_mask, token_type_ids)
         sequence_outputs = bert_outputs[0]
-        # blank_states = sequence_outputs[[i for i in range(len(positions))], positions]  # [batch, hidden_state]
+        pooled_output = bert_outputs[1]
+        # intent 分类
+        mean_pool_output = torch.mean(sequence_outputs * attention_mask.unsqueeze(2), dim=1)
+        mean_pool_output_drop = self.dropout(mean_pool_output)
+        intent_logits = self.intent_classifier(mean_pool_output_drop)
+        # slot
         if self.task_config.use_lstm:
-            sequence_outputs, _ = self.lstm(sequence_outputs)
-
-        sequence_outputs_drop = self.dropout(sequence_outputs)
-        emissions = self.linear(sequence_outputs_drop)
-        
-        logits = self.crf.viterbi_decode(emissions, attention_mask.byte())
-
+            bilstm_outputs, _ = self.lstm(sequence_outputs)
+        bilstm_outputs_drop = self.dropout(bilstm_outputs)
+        emissions = self.slot_classifier(bilstm_outputs_drop)
+        slot_logits = self.crf.viterbi_decode(emissions, attention_mask.byte())
         outputs = {
-            "logits": logits
+            "intent_logits": intent_logits,
+            "slot_logits": slot_logits,
         }
+        if intent_ids is not  None:
+            loss_fn = nn.BCEWithLogitsLoss(pos_weight=intent_weights)  # pos_weight=intent_weights
+            intent_loss = loss_fn(intent_logits, intent_ids.float()) 
+            outputs["intent_loss"] = intent_loss
+            outputs["loss"] = intent_loss
         if slot_ids is not  None:
-            loss = -1*self.crf(emissions, slot_ids, mask=attention_mask.byte()) 
-            outputs["loss"] = loss
+            slot_loss = -1 * self.crf(emissions, slot_ids, mask=attention_mask.byte())
+            slot_loss = slot_loss.mean()
+            outputs["slot_loss"] = slot_loss
+            outputs["loss"] += slot_loss
         
         return outputs
 
@@ -135,16 +157,19 @@ class Crosswoz_nlu(Basic_task):
         self.max_len = task_config.max_len
         # model init 模型初始化，加载预训练模型
         self.model_config = BertConfig.from_pretrained(self.task_config.model_config_path)
+
         self.vocab = Vocab(task_config.vocab_path)
         self.slot_vocab = Vocab(self.task_config.slot_vocab_path)
         self.intent_vocab = Vocab(self.task_config.intent_vocab_path)
-        
-        task_config.num_labels = self.slot_vocab.vocab_size
+        self.intent_weights = np.ones((self.intent_vocab.vocab_size), dtype=np.float)
+       
+        self.task_config.intent_num_labels = self.intent_vocab.vocab_size
+        self.task_config.slot_num_labels = self.slot_vocab.vocab_size
         if task_config.do_train:
             self.model = Model.from_pretrained(pretrained_model_name_or_path=self.task_config.bert_model_path,
-                                           config=self.model_config, task_config=task_config)
+                                           config=self.model_config, task_config=self.task_config)
         else:
-            self.model = Model(self.model_config, task_config=task_config)
+            self.model = Model(self.model_config, task_config=self.task_config)
 
         if self.task_config.gpuids != None:
             self.model.to(self.device)
@@ -161,14 +186,28 @@ class Crosswoz_nlu(Basic_task):
         )
         metric = SeqEntityScore(self.slot_vocab.id2word, markup="bio")
         outputs = self.predict(self.model, data_loader)
+        pred_intents = []
+        golden_intents = []
         for output in outputs:
-            logits = output.pop("logits")      
+            intent_logits = output["intent_logits"]
+            pre_intents = []
+            intent_probs = torch.sigmoid(intent_logits)
+            intent_ids = torch.gt(intent_probs, 0.8).nonzero().squeeze(1).numpy().tolist()
+            for intent_id in intent_ids:
+                intent = self.intent_vocab.id2word[intent_id]
+                pre_intents.append(intent)
+            pred_intents.append(pre_intents)
+
+            slot_logits = output["slot_logits"]      
             text = output["utterance"]
-            tag = logits[1:-1]
+            tag = slot_logits[1:-1]
             text_len = min(len(text), self.max_len - 2)
             assert len(tag) == text_len
             pred_tags = [self.slot_vocab.id2word[t] for t in tag]
             if mode == Task_Mode.Eval:
+                true_intents = output['intents'].split(" ")
+                golden_intents.append(true_intents)
+
                 slot_ids = output['slot_ids'].cpu().numpy().tolist()
                 label = slot_ids[1:text_len + 1]
                 assert len(label) == text_len
@@ -179,9 +218,12 @@ class Crosswoz_nlu(Basic_task):
                 output["result"] = entities
     
         if mode == Task_Mode.Eval:
+            precision, recall, f1 = calculateF1(golden_intents, pred_intents)
             eval_info, entity_info = metric.eval_result()
-            info = ", ".join([f' {key}: {value:.4f} ' for key, value in eval_info.items()])
-            logger.info(f"Evaluate: epoch={epoch}, step={self.global_step}, {info}")
+            logger.info(f"******* Evaluate: epoch={epoch}, step={self.global_step} *******")
+            slot_info = ", ".join([f' {key} = {value:.4f} ' for key, value in eval_info.items()])
+            logger.info(f"intent: p = {precision:.4f}, r = {recall:.4f}, f1 = {f1:.4f}")
+            logger.info(f"slot: {slot_info}")
             return eval_info["f1"]
         else:
             return outputs
@@ -203,11 +245,18 @@ class Crosswoz_nlu(Basic_task):
         # Train the model on each batch
         # Reset gradients
         loss_buffer = 0
+        intent_losses= []
+        slot_losses= []
         for epoch in range(self.task_config.epochs):
             for bi, batch in enumerate(data_loader):
+                batch["intent_weights"] = self.intent_weights
                 self.model.zero_grad()
                 outputs = self.run_one_step(batch, self.model)
-                logits = outputs.pop("logits")
+                # logits = outputs.pop("logits")
+                intent_loss = outputs.pop("intent_loss")
+                slot_loss = outputs.pop("slot_loss")
+                intent_losses.append(intent_loss.item())
+                slot_losses.append(slot_loss.item())
                 loss = outputs.pop("loss")
                 # Calculate gradients based on loss
                 loss = loss.mean()
@@ -221,7 +270,7 @@ class Crosswoz_nlu(Basic_task):
                 if self.global_step % self.task_config.nlog == 0:
                     logger.info("epoch={}, step={}, loss={:.4f}".format(epoch+1, self.global_step, loss_buffer / self.task_config.nlog))
                     loss_buffer = 0
-                
+
             if valid_dataset != None:
                 eval_score = self.evaluate(valid_dataset, mode=Task_Mode.Eval, epoch=epoch+1)
                 self.model.train()
@@ -232,6 +281,25 @@ class Crosswoz_nlu(Basic_task):
                         break
             # 保存训练过程中的模型，防止意外程序停止，可以接着继续训练
             # self.save_checkpoint(model=self.model, model_path=self.task_config.model_save_path, epoch=epoch)
+        logging.info(f"global step = {self.global_step}")
+        intent_losses = np.array(intent_losses)
+        slot_losses = np.array(slot_losses)
+        np.save("/workspace/crosswoz_nlu/output/intent_losses.npy", intent_losses)
+        np.save("/workspace/crosswoz_nlu/output/slot_losses.npy", slot_losses)
+        self.plot_loss(self.global_step)
+
+    def plot_loss(self, global_step):
+        intent_losses = np.load("/workspace/crosswoz_nlu/output/intent_losses.npy")
+        slot_losses = np.load("/workspace/crosswoz_nlu/output/slot_losses.npy")
+        steps = np.arange(1, global_step + 1)
+        plt.plot(steps, intent_losses)
+        plt.plot(steps, slot_losses)
+        plt.xlabel('training step')
+        plt.ylabel('loss')
+        plt.show()
+        plt.savefig("/workspace/crosswoz_nlu/output/loss.jpg")
+        plt.close()
+
     
     def read_data(self, file, mode):
         """
@@ -241,6 +309,7 @@ class Crosswoz_nlu(Basic_task):
         with open(file, "r", encoding="utf-8") as fin:
             data = json.load(fin)
             tk0 = tqdm(data.items(), total=len(data))
+            
             for sess_id, sess in tk0:  
                 for uttr in sess:
                     uttr_id = uttr["uttr_id"]
@@ -253,7 +322,13 @@ class Crosswoz_nlu(Basic_task):
                     input_ids = [self.vocab.get_id("[CLS]")] + [self.vocab.word2id.get(t, self.vocab.get_id("[UNK]")) for t in utterance][:self.max_len - 2] + [self.vocab.get_id("[SEP]")]
                     token_type_ids = [0] * len(input_ids) + [0] * (self.max_len - len(input_ids))
                     input_masks = [1] * len(input_ids) + [0] * (self.max_len - len(input_ids))
-                    
+                    # intent ids
+                    intent_ids = np.zeros((self.intent_vocab.vocab_size), dtype=np.int)
+                    for intent in intents:
+                        idx = self.intent_vocab.word2id[intent]
+                        self.intent_weights[idx] += 1
+                        intent_ids[idx] = 1
+                    # 槽位id
                     slot_ids = [0] + [self.slot_vocab.word2id.get(each, self.vocab.get_id("[UNK]")) for each in tags.split(" ")][:self.max_len - 2] + [0]
                     assert len(input_ids) == len(slot_ids)
                     
@@ -264,7 +339,6 @@ class Crosswoz_nlu(Basic_task):
                     assert len(input_masks) == self.max_len
                     assert len(token_type_ids) == self.max_len
                     assert len(slot_ids) == self.max_len
-                  
 
                     dataset.append({
                         "sess_id": sess_id,
@@ -275,8 +349,28 @@ class Crosswoz_nlu(Basic_task):
                         'input_ids': torch.tensor(input_ids, dtype=torch.long),
                         'input_masks': torch.tensor(input_masks, dtype=torch.long),
                         'token_type_ids': torch.tensor(token_type_ids, dtype=torch.long),
-                        'slot_ids': torch.tensor(slot_ids, dtype=torch.long),
+                        'intent_ids': torch.tensor(intent_ids, dtype=torch.long),
+                        'slot_ids': torch.tensor(slot_ids, dtype=torch.long),  
                     })
+        keys = [k for k in range(self.intent_vocab.vocab_size)]
+        intent_names = [self.intent_vocab.id2word[k] for k in keys]
+        plt.bar(keys, self.intent_weights, align='center', alpha=0.7)
+        plt.xticks(keys)
+        plt.xlabel('class')
+        plt.ylabel('number')
+        plt.show()
+        plt.savefig("/workspace/crosswoz_nlu/output/class_distribute.jpg")
+        plt.close()
+
+        # if mode == Task_Mode.Train:
+        #     train_size = len(dataset)
+        #     for intent, intent_id in self.intent_vocab.word2id.items():  
+        #         neg_pos = (train_size - self.intent_weights[intent_id]) / self.intent_weights[intent_id]
+        #         if neg_pos > 2:
+        #             self.intent_weights[intent_id] = np.log10(neg_pos)  
+        #         else:
+        #             self.intent_weights[intent_id] = neg_pos   
+        #     self.intent_weights = torch.tensor(self.intent_weights)
 
         return dataset
 
@@ -308,7 +402,7 @@ def run():
         for dev_path in config.dev_data_path:
             logging.info(f"Evaluating model in {dev_path}")
             dataset = task.read_data(dev_path, mode=Task_Mode.Eval)
-            logging.info(f"dev dataset size = {len(dataset)}")
+            logging.info(f"eval dataset size = {len(dataset)}")
             task.evaluate(dataset, mode=Task_Mode.Eval)
     if config.do_infer:
         task.load_model(config.model_save_path)
@@ -318,3 +412,5 @@ def run():
 
 if __name__ == '__main__':
     run()
+    
+    

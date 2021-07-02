@@ -1,4 +1,5 @@
 import os
+from numpy.core.defchararray import endswith
 from transformers import get_linear_schedule_with_warmup
 from transformers import AdamW 
 import torch
@@ -102,12 +103,12 @@ class Basic_task(object):
             model_outputs = self.run_one_step(batch, model)
             for k, v in model_outputs.items():
                 if isinstance(v, torch.Tensor):
-                    model_outputs[k] = v.detach().cpu().numpy().tolist()
+                    model_outputs[k] = v.detach().cpu()
             keys = list(batch.keys())
             batch_size = len(batch[keys[0]])
             for i in range(batch_size):
                 item_output = {k: v[i] for k, v in batch.items()}
-                item_output.update({k: v[i] for k, v in model_outputs.items()})   
+                item_output.update({k: v[i] for k, v in model_outputs.items() if not k.endswith("loss")})   
                 outputs.append(item_output)  
         return outputs
 
