@@ -34,7 +34,7 @@ Crosswoz NLU任务
     -验证集：500个对话，8458个utterance（句子）
     -测试集：500个对话，8476个utterance（句子）
 槽位提取模型：bert + Bilstm + crf  
-intent 模型：bert + Bilstm + linear + sigmoid
+intent 模型：bert + mean pool + linear + sigmoid
 
 intent识别效果
     验证集： p = 0.9865, r = 0.9042, f1 = 0.9435
