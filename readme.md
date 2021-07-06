@@ -9,11 +9,12 @@
 
 ### 3、NLU任务说明
 
-数据集：Crosswoz数据
-    -训练集：5012个对话，84692个utterance（句子）
-    -验证集：500个对话，8458个utterance（句子）
-    -测试集：500个对话，8400个utterance（句子）
-槽位提取模型：bert + Bilstm + crf
+数据集：Crosswoz数据  
+    -训练集：5012个对话，84692个utterance（句子）  
+    -验证集：500个对话，8458个utterance（句子）  
+    -测试集：500个对话，8400个utterance（句子）  
+    
+槽位提取模型：bert + Bilstm + crf  
 intent 模型：
 
 ### 4、环境需求
